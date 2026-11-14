@@ -7,6 +7,31 @@ pub struct Sprite {
     pub rect: Rect,
 }
 
+/// Resizes `image` so neither dimension exceeds `max_size`, preserving aspect
+/// ratio. Nearest-neighbor sampling is sufficient because the result is only
+/// ever an emergency fallback for glyphs that should never have been
+/// rasterized that large.
+fn downscale_image(image: Image, max_size: u16) -> Image {
+    let scale = max_size as f32 / image.width.max(image.height) as f32;
+    let new_width = ((image.width as f32 * scale).round() as u16).max(1);
+    let new_height = ((image.height as f32 * scale).round() as u16).max(1);
+
+    let mut bytes = Vec::with_capacity(new_width as usize * new_height as usize * 4);
+    for ny in 0..new_height {
+        for nx in 0..new_width {
+            let sx = (nx as u32 * image.width as u32 / new_width as u32) as usize;
+            let sy = (ny as u32 * image.height as u32 / new_height as u32) as usize;
+            let src = (sy * image.width as usize + sx) * 4;
+            bytes.extend_from_slice(&image.bytes[src..src + 4]);
+        }
+    }
+    Image {
+        bytes,
+        width: new_width,
+        height: new_height,
+    }
+}
+
 #[derive(Debug, Eq, PartialEq, Hash, Clone, Copy)]
 pub enum SpriteKey {
     Texture(miniquad::TextureId),
@@ -26,6 +51,13 @@ pub struct Atlas {
 
     unique_id: u64,
 }
+
+/// Upper bound for the atlas dimensions. Growth doubles the texture each
+/// time, so an unbounded atlas fed by a huge (or maliciously sized) glyph
+/// would first exhaust memory and then overflow the GPU texture size math.
+/// 4096 px is large enough for every realistic font size while keeping the
+/// backing RGBA buffer at 64 MiB.
+const MAX_ATLAS_SIZE: u16 = 4096;
 
 impl Drop for Atlas {
     fn drop(&mut self) {
@@ -123,6 +155,17 @@ impl Atlas {
     }
 
     pub fn cache_sprite(&mut self, key: SpriteKey, sprite: Image) {
+        // A glyph wider or taller than the largest atlas we are willing to
+        // allocate can never fit. Downscale the bitmap to the cap instead of
+        // growing the atlas until the GPU size arithmetic overflows; the
+        // sprite still occupies its (clamped) rect and renders as a blurry but
+        // intact glyph rather than crashing the frame.
+        let sprite = if sprite.width > MAX_ATLAS_SIZE || sprite.height > MAX_ATLAS_SIZE {
+            downscale_image(sprite, MAX_ATLAS_SIZE)
+        } else {
+            sprite
+        };
+
         let (width, height) = (sprite.width as usize, sprite.height as usize);
 
         let x = if self.cursor_x as u32 + width as u32 + Self::GAP as u32 <= self.image.width as u32
@@ -143,6 +186,48 @@ impl Atlas {
 
         // texture bounds exceeded
         if y + sprite.height > self.image.height || x + sprite.width > self.image.width {
+            // The atlas has already reached its cap: there is nowhere left to
+            // grow. Rather than overflowing the texture dimensions (or
+            // recursing forever while the sprite still does not fit), evict
+            // the whole cache once and place the incoming sprite in the fresh
+            // buffer directly. Evicted glyphs are lazily re-rasterized later.
+            // Evict when no amount of further doubling can fit the sprite:
+            // one dimension is already at its cap while the sprite still
+            // overflows it, or both axes have reached the cap. Growing past
+            // this point would either never converge (infinite recursion) or
+            // overflow the GPU texture size arithmetic.
+            let growth_exhausted = (self.image.width >= MAX_ATLAS_SIZE
+                && x + sprite.width > self.image.width)
+                || (self.image.height >= MAX_ATLAS_SIZE
+                    && y + sprite.height > self.image.height)
+                || (self.image.width >= MAX_ATLAS_SIZE && self.image.height >= MAX_ATLAS_SIZE);
+            if growth_exhausted {
+                self.cursor_x = 0;
+                self.cursor_y = 0;
+                self.max_line_height = 0;
+                self.sprites.clear();
+                self.image = Image::gen_image_color(
+                    MAX_ATLAS_SIZE,
+                    MAX_ATLAS_SIZE,
+                    Color::new(0.0, 0.0, 0.0, 0.0),
+                );
+                // The top-level downscale guarantees the sprite fits, but keep
+                // a defensive clamp so this path can never re-enter the
+                // bounds-exceeded branch and recurse indefinitely.
+                let sprite = if sprite.width > MAX_ATLAS_SIZE || sprite.height > MAX_ATLAS_SIZE {
+                    downscale_image(sprite, MAX_ATLAS_SIZE)
+                } else {
+                    sprite
+                };
+                // Fresh, empty buffer: place at the origin. A full-cap
+                // sprite leaves no room for the usual GAP margin, whereas
+                // anything smaller still fits at (0,0) regardless.
+                self.max_line_height = sprite.height;
+                self.cursor_x = sprite.width + Self::GAP;
+                self.place_sprite(key, sprite, 0, 0);
+                return;
+            }
+
             // reset glyph cache state
             self.cursor_x = 0;
             self.cursor_y = 0;
@@ -150,12 +235,12 @@ impl Atlas {
 
             let old_image = self.image.clone();
 
-            // increase font texture size
+            // increase font texture size, clamped to the atlas cap.
             // note: if we tried to fit gigantic texture into a small atlas,
             // new_width will still be not enough. But its fine, it will
             // be regenerated on the recursion call.
-            let new_width = self.image.width * 2;
-            let new_height = self.image.height * 2;
+            let new_width = (self.image.width * 2).min(MAX_ATLAS_SIZE);
+            let new_height = (self.image.height * 2).min(MAX_ATLAS_SIZE);
 
             self.image =
                 Image::gen_image_color(new_width, new_height, Color::new(0.0, 0.0, 0.0, 0.0));
@@ -188,25 +273,38 @@ impl Atlas {
             // cache the new sprite
             self.cache_sprite(key, sprite);
         } else {
-            self.dirty = true;
-
-            for j in 0..height {
-                for i in 0..width {
-                    self.image.set_pixel(
-                        x as u32 + i as u32,
-                        y as u32 + j as u32,
-                        sprite.get_pixel(i as u32, j as u32),
-                    );
-                }
-            }
-
-            self.sprites.insert(
-                key,
-                Sprite {
-                    rect: Rect::new(x as f32, y as f32, width as f32, height as f32),
-                },
-            );
+            self.place_sprite(key, sprite, x, y);
         }
+    }
+
+    /// Writes an already-positioned sprite's pixels at (`x`, `y`) and records
+    /// its rect, advancing the row cursor. Callers must guarantee the sprite
+    /// fits inside the current atlas image.
+    fn place_sprite(&mut self, key: SpriteKey, sprite: Image, x: u16, y: u16) {
+        let (width, height) = (sprite.width as usize, sprite.height as usize);
+
+        debug_assert!(
+            y + sprite.height <= self.image.height && x + sprite.width <= self.image.width,
+            "place_sprite called with a sprite exceeding the atlas bounds"
+        );
+
+        self.dirty = true;
+        for j in 0..height {
+            for i in 0..width {
+                self.image.set_pixel(
+                    x as u32 + i as u32,
+                    y as u32 + j as u32,
+                    sprite.get_pixel(i as u32, j as u32),
+                );
+            }
+        }
+
+        self.sprites.insert(
+            key,
+            Sprite {
+                rect: Rect::new(x as f32, y as f32, width as f32, height as f32),
+            },
+        );
     }
 }
 
@@ -400,5 +498,45 @@ mod tests {
         assert_eq!(pixels, [blue, red, green, white]);
 
         std::mem::forget(first_atlas);
+    }
+
+    // A glyph larger than the atlas cap must be downscaled and placed rather
+    // than driving unbounded growth (which would overflow the GPU texture
+    // size math) or recursing forever once the cap is reached.
+    #[test]
+    fn oversized_sprite_is_clamped_to_atlas_cap_without_recursion() {
+        let mut storage = std::mem::ManuallyDrop::new(atlas(64, 64));
+        let atlas = &mut *storage;
+
+        // Seed a normal sprite first so the eviction path has something to
+        // clear.
+        atlas.cache_sprite(SpriteKey::Id(1), sprite(10, 10, WHITE));
+
+        // A sprite well above the 4096px cap would otherwise grow the atlas
+        // until allocation or arithmetic fails.
+        let huge = sprite(super::MAX_ATLAS_SIZE + 1500, 20, red());
+        atlas.cache_sprite(SpriteKey::Id(2), huge);
+
+        let rect = atlas.get(SpriteKey::Id(2)).expect("huge sprite is stored").rect;
+        assert!(rect.w <= super::MAX_ATLAS_SIZE as f32);
+        assert!(rect.h <= super::MAX_ATLAS_SIZE as f32);
+        assert!(rect.w >= 1.0 && rect.h >= 1.0);
+        // The atlas never grows beyond its hard cap.
+        assert!(atlas.width() <= super::MAX_ATLAS_SIZE);
+        assert!(atlas.height() <= super::MAX_ATLAS_SIZE);
+
+        // A second oversized sprite reuses the eviction path and still
+        // terminates (the original bug was infinite recursion here).
+        let huge2 = sprite(20, super::MAX_ATLAS_SIZE + 2000, green());
+        atlas.cache_sprite(SpriteKey::Id(3), huge2);
+        assert!(atlas.get(SpriteKey::Id(3)).is_some());
+    }
+
+    fn red() -> Color {
+        Color::new(1.0, 0.0, 0.0, 1.0)
+    }
+
+    fn green() -> Color {
+        Color::new(0.0, 1.0, 0.0, 1.0)
     }
 }
